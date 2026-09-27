@@ -33,13 +33,15 @@ claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers
 
 Replace `~/claude-peers-mcp` with wherever you cloned it.
 
-### 3. Run Claude Code with the channel
+### 3. Run Claude Code
+
+On Claude Code v2.1.224+, a plain `claude` session is enough: the broker wakes it through Claude Code's own inbox socket. Older versions need the development channel for push delivery:
 
 ```bash
 claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
 ```
 
-That's it. The broker daemon starts automatically the first time.
+The broker daemon starts automatically the first time. To wake Codex peers and catch missed wakes, also install the hooks (see [Native wake and hooks](#native-wake-and-hooks)).
 
 > **Tip:** Add it to an alias so you don't have to type it every time:
 >
@@ -64,14 +66,14 @@ The other Claude receives it immediately and responds.
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
 | `list_peers`     | Find other Claude Code instances — scoped to `machine`, `directory`, or `repo` |
-| `send_message`   | Send a message to another instance by ID (arrives instantly via channel push)  |
+| `send_message`   | Send a message by ID; the broker wakes the recipient and reports the wake status |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
-| `check_messages` | Check message history — shows all recent messages with `[NEW]` markers, client-type tags, and timestamps |
+| `check_messages` | Read and acknowledge messages — recent history with `[NEW]` markers, client-type tags, and timestamps |
 | `kill_peer`      | Forcibly terminate an unresponsive peer's agent session                        |
 
 ## How it works
 
-A **broker daemon** runs on a Unix domain socket (`~/.claude/run/claude-peers.sock`) backed by SQLite. Each agent session (Claude Code or Codex CLI) spawns an MCP server that registers with the broker. Claude Code peers get messages pushed instantly via [claude/channel](https://code.claude.com/docs/en/channels-reference); Codex peers poll via `check_messages`.
+A **broker daemon** runs on a Unix domain socket (`~/.claude/run/claude-peers.sock`) backed by SQLite. Each agent session (Claude Code or Codex CLI) spawns an MCP server that registers with the broker. When a message arrives, the broker wakes the recipient with a fixed nudge, and the recipient reads it with `check_messages`, the only place a message is acknowledged.
 
 ```
                     ┌───────────────────────────┐
@@ -85,7 +87,19 @@ A **broker daemon** runs on a Unix domain socket (`~/.claude/run/claude-peers.so
                       Claude A         Codex B
 ```
 
-The broker auto-launches when the first session starts. It cleans up dead and orphaned peers automatically (PPID-aware detection every 30s). MCP servers self-terminate when their parent agent exits. Everything is localhost-only.
+The broker auto-launches when the first session starts. It cleans up dead and orphaned peers automatically (PPID-aware detection every 30s) without losing mail: a restarted MCP server inherits its agent's unread messages, and a sender's unread messages outlive it. MCP servers self-terminate when their parent agent exits. Everything is localhost-only.
+
+### Native wake and hooks
+
+| Recipient | Wake | Idle | Busy |
+|-----------|------|------|------|
+| Claude Code v2.1.224+ | [Inbox socket](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket) (`CLAUDE_CODE_MESSAGING_SOCKET`), registered by the MCP server | Starts a turn | Read between tool calls |
+| Codex CLI | `codex queue --thread <session_id>`, thread registered by a Codex hook | Starts a turn | After the current turn |
+| Older Claude Code | `claude/channel` push (development-channels flag) | Pushed | Pushed |
+
+The nudge never carries the message body: `[claude-peers] New message from <peer> (<client>, <dir>). Call check_messages to read and reply.` One wake covers a batch of unread messages; an unanswered wake re-arms after 5 minutes.
+
+`hooks/peers-hook.ts --harness claude|codex` is the safety net. While messages are unread, `Stop` blocks finishing once, `PreToolUse` on Bash reminds the agent before `git add/commit/push`, and `UserPromptSubmit` adds the unread count. On Codex, `SessionStart`, `UserPromptSubmit` and `Stop` register the thread ID for `codex queue`. Wire it into `~/.claude/settings.json` and `~/.codex/hooks.json`, then trust the Codex entries with `/hooks`. The hook fails open and logs quiet failures to `~/.claude/run/claude-peers-hook.log`.
 
 ### Message history
 
@@ -138,12 +152,19 @@ bun cli.ts kill-broker       # stop the broker
 
 | Environment variable | Default              | Description                           |
 | -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
+| `CLAUDE_PEERS_SOCKET` | `~/.claude/run/claude-peers.sock` | Broker Unix socket |
+| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path (kept owner-only) |
+| `CLAUDE_PEERS_TCP` / `CLAUDE_PEERS_PORT` | unset / `7899` | Optional TCP fallback |
+| `CLAUDE_PEERS_CODEX_BIN` | `codex` on PATH + Homebrew | Binary for `codex queue` wakes |
+| `CLAUDE_PEERS_INBOX_TIMEOUT_MS` | `2000` | Claude inbox write timeout |
+| `CLAUDE_PEERS_CODEX_TIMEOUT_MS` | `10000` | `codex queue` timeout |
+| `CLAUDE_PEERS_WAKE_REARM_MS` | `300000` | Re-arm an unanswered wake |
+| `CLAUDE_PEERS_SWEEP_MS` | `30000` | Stale-peer sweep interval |
+| `CLAUDE_PEERS_HOOK_LOG` | `~/.claude/run/claude-peers-hook.log` | Hook quiet-failure log |
 | `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements
 
 - [Bun](https://bun.sh)
-- Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- Claude Code v2.1.224+ for native wake (older versions: v2.1.80+ with the development channel and a claude.ai login)
+- Codex CLI with `codex queue` and hooks (verified on 0.157.1) for Codex wakes
